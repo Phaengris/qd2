@@ -905,8 +905,12 @@ fn run_window(
             }
 
             if let Some(message) = latest_status {
-                status_label.set_label(&message);
-                status_label.set_visible(true);
+                if message.is_empty() {
+                    status_label.set_visible(false);
+                } else {
+                    status_label.set_label(&message);
+                    status_label.set_visible(true);
+                }
             }
 
             glib::ControlFlow::Continue

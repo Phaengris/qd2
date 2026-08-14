@@ -703,6 +703,7 @@ fn premultiply(channel: u8, alpha: u8) -> u8 {
 pub(super) struct FrameStreamHandler {
     event_tx: EventSender,
     framebuffer: Option<Framebuffer>,
+    disable_notice_pending: bool,
 }
 
 impl FrameStreamHandler {
@@ -710,6 +711,14 @@ impl FrameStreamHandler {
         Self {
             event_tx,
             framebuffer: None,
+            disable_notice_pending: false,
+        }
+    }
+
+    fn clear_disable_notice(&mut self) {
+        if self.disable_notice_pending {
+            self.disable_notice_pending = false;
+            self.send_status("");
         }
     }
 
@@ -794,16 +803,19 @@ impl FrameStreamHandler {
     #[cfg(unix)]
     pub(super) fn emit_dmabuf_scanout(&mut self, scanout: DmabufFrame) {
         self.framebuffer = None;
+        self.clear_disable_notice();
         let _ = self.event_tx.send(ViewerEvent::Dmabuf(scanout));
     }
 
     #[cfg(unix)]
     pub(super) fn update_dmabuf(&mut self, update: UpdateDMABUF) {
+        self.clear_disable_notice();
         let _ = self.event_tx.send(ViewerEvent::DmabufUpdate(update));
     }
 
     pub(super) fn disable(&mut self) {
         self.framebuffer = None;
+        self.disable_notice_pending = true;
         self.send_status("The guest display was disabled.");
     }
 
