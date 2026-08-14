@@ -341,6 +341,69 @@ fn run_window(
         }
     });
 
+    // Auto-resize: forward viewer size changes to the guest via SetUIInfo,
+    // the same mechanism the SPICE vdagent uses. Debounced so an interactive
+    // resize sends one final size instead of a flood.
+    {
+        let input_tx = input_tx.clone();
+        let picture_for_send = picture.clone();
+        let last_sent: Rc<RefCell<(i32, i32)>> = Rc::new(RefCell::new((0, 0)));
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let send_ui_info: Rc<dyn Fn()> = Rc::new(move || {
+            let scale = picture_for_send.scale_factor();
+            let width = picture_for_send.width() * scale;
+            let height = picture_for_send.height() * scale;
+            if width > 0 && height > 0 && *last_sent.borrow() != (width, height) {
+                *last_sent.borrow_mut() = (width, height);
+                let _ = input_tx.send(InputEvent::UiInfo {
+                    width: width as u32,
+                    height: height as u32,
+                });
+            }
+        });
+        let schedule: Rc<dyn Fn()> = Rc::new({
+            let pending = pending.clone();
+            move || {
+                if let Some(source) = pending.borrow_mut().take() {
+                    source.remove();
+                }
+                let send_ui_info = send_ui_info.clone();
+                let pending_inner = pending.clone();
+                let source = glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(350),
+                    move || {
+                        *pending_inner.borrow_mut() = None;
+                        send_ui_info();
+                    },
+                );
+                *pending.borrow_mut() = Some(source);
+            }
+        });
+        window.connect_default_width_notify({
+            let schedule = schedule.clone();
+            move |_| schedule()
+        });
+        window.connect_default_height_notify({
+            let schedule = schedule.clone();
+            move |_| schedule()
+        });
+        window.connect_fullscreened_notify({
+            let schedule = schedule.clone();
+            move |_| schedule()
+        });
+        window.connect_maximized_notify({
+            let schedule = schedule.clone();
+            move |_| schedule()
+        });
+        // First map: the window may already be fullscreen (--fullscreen) before
+        // the picture gets an allocation, so no notify above will fire — request
+        // once the widgets are actually laid out.
+        window.connect_map({
+            let schedule = schedule.clone();
+            move |_| schedule()
+        });
+    }
+
     let hotspot_motion = gtk::EventControllerMotion::new();
     hotspot_motion.connect_enter({
         let window = window.clone();
@@ -999,6 +1062,7 @@ enum InputEvent {
     MouseAbs { x: u32, y: u32 },
     MouseRel { dx: i32, dy: i32 },
     MouseWheel(MouseButton),
+    UiInfo { width: u32, height: u32 },
 }
 
 #[cfg(test)]
