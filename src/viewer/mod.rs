@@ -125,6 +125,7 @@ pub fn connect(
     hotkeys_spec: Option<&str>,
     start_fullscreen: bool,
     undecorated: bool,
+    no_fullscreen_bar: bool,
     dmabuf_partial_updates: bool,
 ) -> Result<()> {
     let hotkeys = hotkeys::ViewerHotkeys::parse(hotkeys_spec)
@@ -156,6 +157,7 @@ pub fn connect(
         hotkeys,
         start_fullscreen,
         undecorated,
+        no_fullscreen_bar,
         dmabuf_partial_updates,
     );
 
@@ -176,6 +178,7 @@ fn run_window(
     hotkeys: hotkeys::ViewerHotkeys,
     start_fullscreen: bool,
     undecorated: bool,
+    no_fullscreen_bar: bool,
     dmabuf_partial_updates: bool,
 ) -> Result<()> {
     gtk::init().context("failed to initialize GTK4")?;
@@ -290,9 +293,13 @@ fn run_window(
         .build();
     fullscreen_revealer.set_child(Some(&floating_controls.container));
     fullscreen_revealer.set_visible(false);
-    overlay.add_overlay(&fullscreen_revealer);
-    overlay.set_measure_overlay(&fullscreen_revealer, false);
-    overlay.set_clip_overlay(&fullscreen_revealer, false);
+    // --no-fullscreen-bar: leave the floating bar and its hotspot unparented so
+    // fullscreen has no screen-edge chrome at all.
+    if !no_fullscreen_bar {
+        overlay.add_overlay(&fullscreen_revealer);
+        overlay.set_measure_overlay(&fullscreen_revealer, false);
+        overlay.set_clip_overlay(&fullscreen_revealer, false);
+    }
 
     let fullscreen_hotspot = gtk::Box::builder()
         .halign(gtk::Align::Center)
@@ -302,9 +309,11 @@ fn run_window(
         .build();
     fullscreen_hotspot.set_opacity(0.0);
     fullscreen_hotspot.set_visible(false);
-    overlay.add_overlay(&fullscreen_hotspot);
-    overlay.set_measure_overlay(&fullscreen_hotspot, false);
-    overlay.set_clip_overlay(&fullscreen_hotspot, false);
+    if !no_fullscreen_bar {
+        overlay.add_overlay(&fullscreen_hotspot);
+        overlay.set_measure_overlay(&fullscreen_hotspot, false);
+        overlay.set_clip_overlay(&fullscreen_hotspot, false);
+    }
 
     let fullscreen_state = Rc::new(RefCell::new(chrome::FullscreenChromeState::default()));
     let titlebar_widget = header_bar.clone().upcast::<gtk::Widget>();
