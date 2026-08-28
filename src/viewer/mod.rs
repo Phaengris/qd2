@@ -3,6 +3,7 @@ mod chooser;
 mod chrome;
 mod clipboard;
 mod cursor;
+mod cursor_scene;
 mod dmabuf;
 mod events;
 mod framebuffer;
@@ -527,6 +528,10 @@ fn run_window(
     let clipboard_state = Rc::new(RefCell::new(clipboard::ClipboardUiState::default()));
     let cursor_state = Rc::new(RefCell::new(cursor::CursorState::default()));
     let mouse_mode = Rc::new(RefCell::new(ready.mouse_mode));
+    let cursor_scene =
+        cursor_scene::CursorScene::new(&picture, ui_state.clone(), mouse_mode.clone());
+    overlay.add_overlay(&cursor_scene);
+    cursor_scene::track_pointer(&picture, &cursor_scene);
     let input_grab = grab::new_state();
     let keyboard_controller = ready.keyboard_available.then(|| {
         keyboard::install_keyboard_controller(
@@ -663,6 +668,7 @@ fn run_window(
         let picture = picture.clone();
         let status_label = status_label.clone();
         let cursor_state = cursor_state.clone();
+        let cursor_scene = cursor_scene.clone();
         let clipboard_state = clipboard_state.clone();
         let input_grab = input_grab.clone();
         let ui_state = ui_state.clone();
@@ -750,10 +756,12 @@ fn run_window(
             if cursor_dirty {
                 let mut current_cursor = cursor_state.borrow_mut();
                 if let Some(shape) = latest_cursor_shape {
-                    current_cursor.set_shape(shape);
+                    cursor_scene.set_shape(shape.as_ref().map(cursor::GuestCursor::to_texture));
+                    current_cursor.set_shape(shape.is_some());
                 }
                 if let Some(visible) = latest_cursor_visible {
                     current_cursor.set_visible(visible);
+                    cursor_scene.set_cursor_visible(visible);
                 }
                 drop(current_cursor);
                 grab::sync_cursor_capture(&picture, &cursor_state, &input_grab, &mouse_mode);
