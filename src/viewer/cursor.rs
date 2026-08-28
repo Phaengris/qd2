@@ -55,7 +55,8 @@ impl GuestCursor {
         }))
     }
 
-    fn to_gdk_cursor(&self) -> gdk::Cursor {
+    /// The cursor texture plus hotspot, for rendering inside the scene.
+    pub(super) fn to_texture(&self) -> (gdk::Texture, i32, i32) {
         let bytes = glib::Bytes::from_owned(self.rgba.clone());
         let texture = gdk::MemoryTexture::new(
             self.width,
@@ -64,8 +65,7 @@ impl GuestCursor {
             &bytes,
             self.stride(),
         );
-        let fallback = gdk::Cursor::from_name("default", None);
-        gdk::Cursor::from_texture(&texture, self.hotspot_x, self.hotspot_y, fallback.as_ref())
+        (texture.upcast(), self.hotspot_x, self.hotspot_y)
     }
 
     fn stride(&self) -> usize {
@@ -106,8 +106,14 @@ impl Default for CursorState {
 }
 
 impl CursorState {
-    pub(super) fn set_shape(&mut self, shape: Option<GuestCursor>) {
-        self.active_cursor = shape.as_ref().map(GuestCursor::to_gdk_cursor);
+    /// While a guest shape is defined the scene draws it (see `cursor_scene`),
+    /// so the widget cursor only needs to keep the host cursor out of the way.
+    pub(super) fn set_shape(&mut self, has_guest_shape: bool) {
+        self.active_cursor = if has_guest_shape {
+            Some(self.hidden_cursor())
+        } else {
+            None
+        };
     }
 
     pub(super) fn set_visible(&mut self, visible: bool) {
