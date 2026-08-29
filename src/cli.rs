@@ -104,6 +104,12 @@ pub struct ConnectArgs {
     /// flicker.
     #[arg(long = "dpu")]
     pub dmabuf_partial_updates: bool,
+
+    /// Set the viewer's application/window identity (Wayland app_id, X11 WM
+    /// class), like spicy's --name. Lets taskbars and window rules match the
+    /// viewer to a specific launcher.
+    #[arg(long, value_name = "APP_ID")]
+    pub name: Option<String>,
 }
 
 impl ConnectArgs {
