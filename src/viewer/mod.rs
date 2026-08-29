@@ -204,9 +204,19 @@ fn run_window(
     status_label.set_margin_start(12);
     status_label.set_margin_end(12);
 
+    // Hand dmabuf frames straight to the compositor as a subsurface instead of
+    // compositing them through GTK's GL renderer — at large guest resolutions
+    // that compositing pass dominates the frame budget. Black-background mode
+    // keeps the subsurface below the UI so overlays (in-scene cursor,
+    // fullscreen bar) can still draw on top.
+    let offload = gtk::GraphicsOffload::new(Some(&picture));
+    offload.set_hexpand(true);
+    offload.set_vexpand(true);
+    offload.set_black_background(true);
+
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     container.append(&status_label);
-    container.append(&picture);
+    container.append(&offload);
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&container));
 
