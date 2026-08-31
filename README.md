@@ -44,6 +44,8 @@ QD2 is built for people who want the flexibility of QEMU's D-Bus display stack w
 | `--undecorated` | Open the GTK4 viewer without normal window decorations for `connect`. | `qd2 connect --undecorated` |
 | `--dpu` | Use QEMU-provided DMABUF damage rectangles instead of the default full-surface DMABUF refresh path. | `qd2 connect --dpu` |
 | `--hotkeys ...` | Override viewer shortcuts in a virt-viewer-style format for `connect`. | `qd2 connect --hotkeys "toggle-fullscreen=ctrl+enter,release-cursor=ctrl+alt"` |
+| `--no-fullscreen-bar` | Hide the floating fullscreen toolbar and its top-edge hover hotspot for `connect`. Useful when the guest has panels at the screen edges. | `qd2 connect --fullscreen --no-fullscreen-bar` |
+| `--name <APP_ID>` | Set the viewer's application identity (Wayland app_id / X11 WM class) so taskbars and window rules can match it, like spicy's `--name`. | `qd2 connect --name my-vm-launcher` |
 
 ## 🖥️ Viewer Highlights
 
@@ -55,6 +57,10 @@ QD2 is built for people who want the flexibility of QEMU's D-Bus display stack w
 - Guest audio playback through the QEMU D-Bus audio interface.
 - Floating fullscreen controls inspired by virt-viewer.
 - Direct fullscreen launch with `qd2 connect --fullscreen`.
+- Guest display resolution follows the viewer window size (including fullscreen).
+- Sharp guest cursor on HiDPI displays: the cursor is rendered inside the scene at content scale instead of through the GTK cursor API.
+- DMABUF frames are offloaded to a compositor subsurface (`GtkGraphicsOffload`), keeping large guest resolutions smooth in fullscreen.
+- Keyboard forwarding starts when the viewer window gains focus (once a display is presented), with host shortcuts restored on focus loss.
 - Optional undecorated launch mode for tiling compositor workflows.
 - Top-bar actions for taking screenshots and sending guest shortcuts like `Ctrl+Alt+Delete`.
 - Configurable hotkeys for fullscreen, grab release, and DMABUF transforms.
@@ -69,7 +75,7 @@ Linux releases also ship native `.deb` and `.rpm` packages. Those packages insta
 Building from source currently requires:
 
 - Rust stable with Cargo
-- GTK4 development files
+- GTK4 development files (GTK 4.16 or newer)
 - pixman development files
 - usbredir 0.13+ libraries visible to `pkg-config` (`libusbredirhost.pc` and `libusbredirparser-0.5.pc`)
 - `pkg-config` or `pkgconf`
