@@ -613,8 +613,10 @@ fn run_window(
             if window.is_active() {
                 // Focus means input: start forwarding keys immediately, like
                 // other viewers do, instead of demanding a first sacrificial
-                // click to activate the grab.
-                if grab::activate(window, &picture, &input_grab, None) {
+                // click to activate the grab. Only once a display is actually
+                // presented — inhibiting host shortcuts while showing a blank
+                // window or an error dialog holds alt-tab hostage.
+                if picture.is_visible() && grab::activate(window, &picture, &input_grab, None) {
                     ui_state.borrow_mut().last_pointer_guest_position = None;
                     grab::sync_cursor_capture(&picture, &cursor_state, &input_grab, &mouse_mode);
                 }
