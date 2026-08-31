@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
-use gtk::{glib, prelude::*};
+use gtk::{gdk, glib, prelude::*};
 use gtk4 as gtk;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -91,6 +91,7 @@ pub(super) fn install_keyboard_controller(
     release_grab: impl Fn() + 'static,
 ) -> KeyboardControllerHandle {
     let state = Rc::new(RefCell::new(PressedKeyState::default()));
+    let release_grab = Rc::new(release_grab);
 
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -98,6 +99,7 @@ pub(super) fn install_keyboard_controller(
         let input_tx = input_tx.clone();
         let input_grab = input_grab.clone();
         let release_hotkey = release_hotkey.clone();
+        let release_grab = release_grab.clone();
         let state = state.clone();
         move |_, keyval, keycode, modifiers| {
             let Some(qnum) = gdk_keycode_to_qnum(keycode) else {
@@ -109,6 +111,18 @@ pub(super) fn install_keyboard_controller(
             }
 
             if release_hotkey.matches(keyval, modifiers) {
+                if release_hotkey.is_modifier_chord() {
+                    // Don't fire on press: the chord is the prefix of every
+                    // `<chord>+<key>` guest shortcut. Arm it, keep forwarding,
+                    // and fire only if it is released without another key.
+                    let mut state = state.borrow_mut();
+                    state.release_chord_armed = true;
+                    if state.press(qnum) {
+                        let _ = input_tx.send(InputEvent::KeyPress(qnum));
+                    }
+                    return glib::Propagation::Stop;
+                }
+
                 let mut state = state.borrow_mut();
                 state.release_all(&input_tx);
                 state.suppress_next_release(qnum);
@@ -117,6 +131,7 @@ pub(super) fn install_keyboard_controller(
             }
 
             let mut state = state.borrow_mut();
+            state.release_chord_armed = false;
             if state.press(qnum) {
                 let _ = input_tx.send(InputEvent::KeyPress(qnum));
             }
@@ -125,13 +140,24 @@ pub(super) fn install_keyboard_controller(
     });
     key_controller.connect_key_released({
         let input_tx = input_tx.clone();
+        let release_hotkey = release_hotkey.clone();
+        let release_grab = release_grab.clone();
         let state = state.clone();
-        move |_, _, keycode, _| {
+        move |_, keyval, keycode, _| {
             let Some(qnum) = gdk_keycode_to_qnum(keycode) else {
                 return;
             };
 
             let mut state = state.borrow_mut();
+            if state.release_chord_armed && release_hotkey.chord_member(keyval) {
+                // Clean chord release: no other key was pressed in between.
+                state.release_chord_armed = false;
+                state.release_all(&input_tx);
+                state.take_suppressed_release(qnum);
+                release_grab();
+                return;
+            }
+
             if state.take_suppressed_release(qnum) {
                 return;
             }
@@ -139,6 +165,18 @@ pub(super) fn install_keyboard_controller(
             if state.release(qnum) {
                 let _ = input_tx.send(InputEvent::KeyRelease(qnum));
             }
+        }
+    });
+    // Safety net for release events GTK never delivers (grab churn, focus
+    // flicker, compositor shortcuts): when the modifier state says a modifier
+    // is up but we still track it as pressed, release it in the guest so it
+    // can never get stuck repeating a chord.
+    key_controller.connect_modifiers({
+        let input_tx = input_tx.clone();
+        let state = state.clone();
+        move |_, modifiers| {
+            state.borrow_mut().reconcile_modifiers(modifiers, &input_tx);
+            glib::Propagation::Proceed
         }
     });
     picture.add_controller(key_controller);
@@ -159,15 +197,41 @@ pub(super) fn send_guest_shortcut(
     }
 }
 
+/// Modifier keys by qnum, paired with the GDK modifier bit they raise.
+/// Used to reconcile our pressed-key tracking against GTK's modifier state.
+const MODIFIER_QNUMS: &[(u32, gdk::ModifierType)] = &[
+    (29, gdk::ModifierType::CONTROL_MASK),  // Ctrl_L
+    (157, gdk::ModifierType::CONTROL_MASK), // Ctrl_R
+    (42, gdk::ModifierType::SHIFT_MASK),    // Shift_L
+    (54, gdk::ModifierType::SHIFT_MASK),    // Shift_R
+    (56, gdk::ModifierType::ALT_MASK),      // Alt_L
+    (184, gdk::ModifierType::ALT_MASK),     // Alt_R / AltGr
+    (219, gdk::ModifierType::SUPER_MASK),   // Super_L
+    (220, gdk::ModifierType::SUPER_MASK),   // Super_R
+];
+
 #[derive(Default)]
 struct PressedKeyState {
     pressed: HashSet<u32>,
     suppressed_releases: HashSet<u32>,
+    release_chord_armed: bool,
 }
 
 impl PressedKeyState {
     fn press(&mut self, qnum: u32) -> bool {
         self.pressed.insert(qnum)
+    }
+
+    fn reconcile_modifiers(
+        &mut self,
+        current: gdk::ModifierType,
+        input_tx: &tokio_mpsc::UnboundedSender<InputEvent>,
+    ) {
+        for &(qnum, mask) in MODIFIER_QNUMS {
+            if !current.contains(mask) && self.pressed.remove(&qnum) {
+                let _ = input_tx.send(InputEvent::KeyRelease(qnum));
+            }
+        }
     }
 
     fn release(&mut self, qnum: u32) -> bool {
@@ -408,6 +472,37 @@ mod tests {
         assert!(state.take_suppressed_release(29));
         assert!(state.take_suppressed_release(56));
         assert!(!state.take_suppressed_release(29));
+    }
+
+    #[test]
+    fn reconcile_modifiers_releases_stuck_modifiers_only() {
+        let (input_tx, mut input_rx) = tokio_mpsc::unbounded_channel();
+        let mut state = PressedKeyState::default();
+
+        assert!(state.press(29)); // Ctrl_L, release will be "lost"
+        assert!(state.press(34)); // G, still physically held
+
+        state.reconcile_modifiers(gdk::ModifierType::empty(), &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some(super::InputEvent::KeyRelease(29))
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(state.pressed.contains(&34));
+        assert!(!state.pressed.contains(&29));
+    }
+
+    #[test]
+    fn reconcile_modifiers_keeps_held_modifiers() {
+        let (input_tx, mut input_rx) = tokio_mpsc::unbounded_channel();
+        let mut state = PressedKeyState::default();
+
+        assert!(state.press(29)); // Ctrl_L
+        state.reconcile_modifiers(gdk::ModifierType::CONTROL_MASK, &input_tx);
+
+        assert!(input_rx.try_recv().is_err());
+        assert!(state.pressed.contains(&29));
     }
 
     #[test]
