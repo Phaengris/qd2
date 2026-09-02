@@ -411,6 +411,28 @@ fn run_window(
             let schedule = schedule.clone();
             move |_| schedule()
         });
+        // The compositor can resize the surface without any of the window
+        // properties above changing — e.g. the monitor's resolution changes
+        // while the viewer is fullscreen. The surface `layout` signal is the
+        // ground truth for actual size changes, so hook it on every realize
+        // (each realize creates a fresh surface).
+        window.connect_realize({
+            let schedule = schedule.clone();
+            move |window| {
+                if let Some(surface) = window.surface() {
+                    surface.connect_layout({
+                        let schedule = schedule.clone();
+                        move |_, _, _| schedule()
+                    });
+                }
+            }
+        });
+        // Moving to a monitor with a different scale changes the physical
+        // pixel count without a logical resize.
+        window.connect_scale_factor_notify({
+            let schedule = schedule.clone();
+            move |_| schedule()
+        });
     }
 
     let hotspot_motion = gtk::EventControllerMotion::new();
