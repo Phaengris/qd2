@@ -356,12 +356,22 @@ fn run_window(
     {
         let input_tx = input_tx.clone();
         let picture_for_send = picture.clone();
+        let window_for_send = window.clone();
         let last_sent: Rc<RefCell<(i32, i32)>> = Rc::new(RefCell::new((0, 0)));
         let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         let send_ui_info: Rc<dyn Fn()> = Rc::new(move || {
-            let scale = picture_for_send.scale_factor();
-            let width = picture_for_send.width() * scale;
-            let height = picture_for_send.height() * scale;
+            // `scale_factor()` is an integer (the ceiling of the real scale).
+            // Under fractional scaling (e.g. 150%) that asks the guest for a
+            // resolution larger than the screen: the picture gets downscaled
+            // and the guest's last pixel row/column becomes unreachable by the
+            // pointer. The surface knows the real scale; floor() absorbs the
+            // logical-size rounding GTK already applied.
+            let scale = window_for_send
+                .surface()
+                .map(|surface| surface.scale())
+                .unwrap_or_else(|| f64::from(picture_for_send.scale_factor()));
+            let width = (f64::from(picture_for_send.width()) * scale).floor() as i32;
+            let height = (f64::from(picture_for_send.height()) * scale).floor() as i32;
             if width > 0 && height > 0 && *last_sent.borrow() != (width, height) {
                 *last_sent.borrow_mut() = (width, height);
                 let _ = input_tx.send(InputEvent::UiInfo {
