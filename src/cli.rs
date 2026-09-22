@@ -100,7 +100,6 @@ pub struct ConnectArgs {
     #[arg(long = "dpu")]
     pub dmabuf_partial_updates: bool,
 
-
     /// Multi-head guests: where each console sits in the guest's desktop, in
     /// guest pixels, as `ID:X,Y;ID:X,Y` (e.g. `0:0,0;1:2560,0`). Default: heads
     /// side by side left-to-right in console order, which is what KDE/GNOME do
