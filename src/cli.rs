@@ -118,6 +118,12 @@ pub struct ConnectArgs {
     /// for absolute pointer positions to land where you click.
     #[arg(long, value_name = "ID:X,Y;...")]
     pub head_layout: Option<String>,
+
+    /// Composite frames through GTK instead of offloading them to a compositor
+    /// subsurface. Slower at large resolutions, but a useful fallback if the
+    /// offload path glitches on your compositor/GTK version.
+    #[arg(long)]
+    pub no_offload: bool,
 }
 
 /// Parse a `--head-layout` spec into `(console id, x, y)` triples.

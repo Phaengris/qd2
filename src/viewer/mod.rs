@@ -128,6 +128,7 @@ pub fn connect(
     undecorated: bool,
     no_fullscreen_bar: bool,
     dmabuf_partial_updates: bool,
+    no_offload: bool,
 ) -> Result<()> {
     let hotkeys = hotkeys::ViewerHotkeys::parse(hotkeys_spec)
         .context("failed to parse `--hotkeys` overrides")?;
@@ -160,6 +161,7 @@ pub fn connect(
         undecorated,
         no_fullscreen_bar,
         dmabuf_partial_updates,
+        no_offload,
     );
 
     let _ = shutdown_tx.send(());
@@ -181,6 +183,7 @@ fn run_window(
     undecorated: bool,
     no_fullscreen_bar: bool,
     dmabuf_partial_updates: bool,
+    no_offload: bool,
 ) -> Result<()> {
     gtk::init().context("failed to initialize GTK4")?;
 
@@ -209,14 +212,17 @@ fn run_window(
     // that compositing pass dominates the frame budget. Black-background mode
     // keeps the subsurface below the UI so overlays (in-scene cursor,
     // fullscreen bar) can still draw on top.
-    let offload = gtk::GraphicsOffload::new(Some(&picture));
-    offload.set_hexpand(true);
-    offload.set_vexpand(true);
-    offload.set_black_background(true);
-
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     container.append(&status_label);
-    container.append(&offload);
+    if no_offload {
+        container.append(&picture);
+    } else {
+        let offload = gtk::GraphicsOffload::new(Some(&picture));
+        offload.set_hexpand(true);
+        offload.set_vexpand(true);
+        offload.set_black_background(true);
+        container.append(&offload);
+    }
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&container));
 
@@ -1105,7 +1111,7 @@ struct ViewerReady {
 #[derive(Default)]
 struct UiState {
     frame_size: Option<(u32, u32)>,
-    last_pointer_guest_position: Option<(u32, u32)>,
+    last_pointer_guest_position: Option<(i32, i32)>,
 }
 
 enum ViewerEvent {
@@ -1131,7 +1137,7 @@ enum InputEvent {
     ClipboardHostChanged(ClipboardSelection, Option<clipboard::ClipboardContent>),
     MousePress(MouseButton),
     MouseRelease(MouseButton),
-    MouseAbs { x: u32, y: u32 },
+    MouseAbs { x: i32, y: i32 },
     MouseRel { dx: i32, dy: i32 },
     MouseWheel(MouseButton),
     UiInfo { width: u32, height: u32 },
@@ -1245,15 +1251,16 @@ mod tests {
             widget_coords_to_guest_position(800, 600, 640, 480, 400.0, 300.0),
             Some((320, 240))
         );
-        // in the letterbox margin: clamped onto the top edge, not dropped
+        // in the letterbox margin: reported as-is (one row above the top);
+        // the input session clamps to the head or continues onto a neighbor
         assert_eq!(
             widget_coords_to_guest_position(800, 600, 640, 360, 400.0, 74.0),
-            Some((320, 0))
+            Some((320, -1))
         );
-        // pushed past the bottom edge: lands on the last guest row
+        // pushed past the bottom edge: beyond the last guest row, unclamped
         assert_eq!(
             widget_coords_to_guest_position(800, 600, 640, 360, 400.0, 599.9),
-            Some((320, 359))
+            Some((320, 419))
         );
         assert_eq!(
             widget_coords_to_guest_position(800, 600, 640, 360, 400.0, 300.0),
