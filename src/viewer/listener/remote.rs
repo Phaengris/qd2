@@ -34,6 +34,8 @@ pub(super) struct RemoteConsole {
     siblings: Vec<(u32, ConsoleProxy<'static>)>,
     explicit_layout: Vec<(u32, i32, i32)>,
     head_map: std::sync::Mutex<Option<HeadMap>>,
+    /// This console's own size, for clamping single-head positions.
+    self_size: std::sync::Mutex<Option<(u32, u32)>>,
     head_map_refreshed: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
@@ -91,16 +93,32 @@ pub(super) fn compute_head_map(
 }
 
 /// Translate a console-local absolute position for QEMU (see [`HeadMap`]).
-pub(super) fn map_abs_position(map: &HeadMap, x: u32, y: u32) -> (u32, u32) {
+/// The position may lie outside this head (negative, or past its edge): it
+/// is clamped to the guest's WHOLE desktop, so a pointer dragged past the
+/// window edge keeps moving onto the neighboring head.
+pub(super) fn map_abs_position(map: &HeadMap, x: i64, y: i64) -> (u32, u32) {
     if map.width <= 0 || map.height <= 0 || map.total_width <= 0 || map.total_height <= 0 {
-        return (x, y);
+        return (x.max(0) as u32, y.max(0) as u32);
     }
-    let gx = (map.offset_x + i64::from(x)) * map.width / map.total_width;
-    let gy = (map.offset_y + i64::from(y)) * map.height / map.total_height;
+    let global_x = (map.offset_x + x).clamp(0, map.total_width - 1);
+    let global_y = (map.offset_y + y).clamp(0, map.total_height - 1);
+    let sx = global_x * map.width / map.total_width;
+    let sy = global_y * map.height / map.total_height;
     (
-        gx.clamp(0, map.width - 1) as u32,
-        gy.clamp(0, map.height - 1) as u32,
+        sx.clamp(0, map.width - 1) as u32,
+        sy.clamp(0, map.height - 1) as u32,
     )
+}
+
+/// Single-head clamp: keep the position inside the console.
+pub(super) fn clamp_to_console(size: Option<(u32, u32)>, x: i64, y: i64) -> (u32, u32) {
+    match size {
+        Some((w, h)) if w > 0 && h > 0 => (
+            x.clamp(0, i64::from(w) - 1) as u32,
+            y.clamp(0, i64::from(h) - 1) as u32,
+        ),
+        _ => (x.max(0) as u32, y.max(0) as u32),
+    }
 }
 
 impl RemoteConsole {
@@ -155,6 +173,7 @@ impl RemoteConsole {
             siblings,
             explicit_layout,
             head_map: std::sync::Mutex::new(None),
+            self_size: std::sync::Mutex::new(None),
             head_map_refreshed: std::sync::Mutex::new(None),
         })
     }
@@ -179,10 +198,6 @@ impl RemoteConsole {
     /// startup, on every button press, and at most once per second while the
     /// pointer moves, so other windows resizing their heads is picked up.
     pub(super) async fn refresh_head_map(&self) -> Result<()> {
-        if self.siblings.len() < 2 {
-            *self.head_map.lock().unwrap() = None;
-            return Ok(());
-        }
         let mut sizes = Vec::with_capacity(self.siblings.len());
         for (id, proxy) in &self.siblings {
             let width = proxy
@@ -194,6 +209,9 @@ impl RemoteConsole {
                 .await
                 .with_context(|| format!("console {id} height"))?;
             sizes.push((*id, width, height));
+        }
+        if let Some((_, w, h)) = sizes.iter().find(|(id, _, _)| *id == self.console_id) {
+            *self.self_size.lock().unwrap() = Some((*w, *h));
         }
         let map = compute_head_map(&sizes, &self.explicit_layout, self.console_id);
         *self.head_map.lock().unwrap() = map;
@@ -207,15 +225,16 @@ impl RemoteConsole {
             .lock()
             .unwrap()
             .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
-        if stale && self.siblings.len() >= 2 {
+        if stale && !self.siblings.is_empty() {
             let _ = self.refresh_head_map().await;
         }
     }
 
-    fn map_abs(&self, x: u32, y: u32) -> (u32, u32) {
+    fn map_abs(&self, x: i32, y: i32) -> (u32, u32) {
+        let (x, y) = (i64::from(x), i64::from(y));
         match *self.head_map.lock().unwrap() {
             Some(map) => map_abs_position(&map, x, y),
-            None => (x, y),
+            None => clamp_to_console(*self.self_size.lock().unwrap(), x, y),
         }
     }
 
@@ -621,7 +640,7 @@ impl LocalConsoleListenerDmabuf2 {
 
 #[cfg(test)]
 mod head_map_tests {
-    use super::{compute_head_map, map_abs_position};
+    use super::{clamp_to_console, compute_head_map, map_abs_position};
 
     #[test]
     fn single_head_has_no_map() {
@@ -653,6 +672,29 @@ mod head_map_tests {
         assert_eq!((head1.total_width, head1.total_height), (1920, 2160));
         let (x, y) = map_abs_position(&head1, 100, 100);
         assert_eq!((x, y), (100, (1080 + 100) * 1080 / 2160));
+    }
+
+    #[test]
+    fn positions_beyond_a_head_continue_onto_the_neighbor() {
+        let sizes = [(0, 2560, 1440), (1, 1280, 1024)];
+        let head0 = compute_head_map(&sizes, &[], 0).unwrap();
+        // 100px past head 0's right edge = 100px into head 1 (global 2660 of 3840)
+        let (x, _) = map_abs_position(&head0, 2660, 100);
+        assert_eq!(i64::from(x), 2660 * 2560 / 3840);
+        assert!(
+            x < 2560,
+            "pre-scaled position must satisfy QEMU's range check"
+        );
+        // far left of head 1 = clamped to the desktop's left edge
+        let head1 = compute_head_map(&sizes, &[], 1).unwrap();
+        assert_eq!(map_abs_position(&head1, -5000, 10).0, 0);
+    }
+
+    #[test]
+    fn single_head_positions_are_clamped_to_the_console() {
+        assert_eq!(clamp_to_console(Some((640, 480)), -7, 500), (0, 479));
+        assert_eq!(clamp_to_console(Some((640, 480)), 100, 100), (100, 100));
+        assert_eq!(clamp_to_console(None, -3, 9), (0, 9));
     }
 
     #[test]
