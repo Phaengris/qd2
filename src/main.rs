@@ -62,6 +62,8 @@ async fn run_connect_command(args: ConnectArgs) -> Result<()> {
         }
     };
     print_warnings(&target.warnings);
+    let mut target = target;
+    target.head_layout = cli::parse_head_layout(args.head_layout.as_deref())?;
     viewer::connect(
         target,
         args.address(),

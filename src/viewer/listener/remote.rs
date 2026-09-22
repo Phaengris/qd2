@@ -29,10 +29,100 @@ pub(super) struct RemoteConsole {
     keyboard: KeyboardProxy<'static>,
     mouse: MouseProxy<'static>,
     listener_connection: Option<Connection>,
+    console_id: u32,
+    /// Every console of the VM (including ours), for reading head sizes.
+    siblings: Vec<(u32, ConsoleProxy<'static>)>,
+    explicit_layout: Vec<(u32, i32, i32)>,
+    head_map: std::sync::Mutex<Option<HeadMap>>,
+    head_map_refreshed: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// Where this console sits inside the guest's whole desktop, in guest pixels.
+///
+/// QEMU scales an absolute position by the *console's* own size, but the
+/// guest's single absolute pointing device spans the *whole* desktop. For a
+/// multi-head guest we therefore translate a console-local position into the
+/// global one and pre-scale it so QEMU's per-console scaling lands exactly:
+/// `x' = (offset_x + x) * console_w / total_w`. Single head = identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HeadMap {
+    offset_x: i64,
+    offset_y: i64,
+    width: i64,
+    height: i64,
+    total_width: i64,
+    total_height: i64,
+}
+
+/// Build the head map from `(id, width, height)` of every console. Explicit
+/// `(id, x, y)` offsets win; otherwise heads are laid out left-to-right in id
+/// order (the default hot-plug arrangement of KDE and GNOME).
+pub(super) fn compute_head_map(
+    sizes: &[(u32, u32, u32)],
+    explicit: &[(u32, i32, i32)],
+    self_id: u32,
+) -> Option<HeadMap> {
+    if sizes.len() < 2 {
+        return None;
+    }
+    let mut sizes = sizes.to_vec();
+    sizes.sort_by_key(|(id, _, _)| *id);
+    let mut placed = Vec::with_capacity(sizes.len());
+    let mut cursor_x: i64 = 0;
+    for (id, w, h) in &sizes {
+        let (x, y) = match explicit.iter().find(|(eid, _, _)| eid == id) {
+            Some((_, x, y)) => (i64::from(*x), i64::from(*y)),
+            None => (cursor_x, 0),
+        };
+        cursor_x = cursor_x.max(x + i64::from(*w));
+        placed.push((*id, x, y, i64::from(*w), i64::from(*h)));
+    }
+    let total_width = placed.iter().map(|(_, x, _, w, _)| x + w).max()?;
+    let total_height = placed.iter().map(|(_, _, y, _, h)| y + h).max()?;
+    let (_, offset_x, offset_y, width, height) = *placed.iter().find(|(id, ..)| *id == self_id)?;
+    Some(HeadMap {
+        offset_x,
+        offset_y,
+        width,
+        height,
+        total_width,
+        total_height,
+    })
+}
+
+/// Translate a console-local absolute position for QEMU (see [`HeadMap`]).
+pub(super) fn map_abs_position(map: &HeadMap, x: u32, y: u32) -> (u32, u32) {
+    if map.width <= 0 || map.height <= 0 || map.total_width <= 0 || map.total_height <= 0 {
+        return (x, y);
+    }
+    let gx = (map.offset_x + i64::from(x)) * map.width / map.total_width;
+    let gy = (map.offset_y + i64::from(y)) * map.height / map.total_height;
+    (
+        gx.clamp(0, map.width - 1) as u32,
+        gy.clamp(0, map.height - 1) as u32,
+    )
 }
 
 impl RemoteConsole {
-    pub(super) async fn new(connection: &Connection, owner: &str, console_id: u32) -> Result<Self> {
+    pub(super) async fn new(
+        connection: &Connection,
+        owner: &str,
+        console_id: u32,
+        console_ids: &[u32],
+        explicit_layout: Vec<(u32, i32, i32)>,
+    ) -> Result<Self> {
+        let mut siblings = Vec::new();
+        for id in console_ids {
+            let path = OwnedObjectPath::try_from(format!("/org/qemu/Display1/Console_{id}"))?;
+            let sibling = ConsoleProxy::builder(connection)
+                .cache_properties(CacheProperties::No)
+                .destination(owner.to_owned())?
+                .path(path)?
+                .build()
+                .await
+                .with_context(|| format!("failed to build the proxy for console {id}"))?;
+            siblings.push((*id, sibling));
+        }
         let object_path =
             OwnedObjectPath::try_from(format!("/org/qemu/Display1/Console_{console_id}"))?;
         let proxy = ConsoleProxy::builder(connection)
@@ -61,6 +151,11 @@ impl RemoteConsole {
             keyboard,
             mouse,
             listener_connection: None,
+            console_id,
+            siblings,
+            explicit_layout,
+            head_map: std::sync::Mutex::new(None),
+            head_map_refreshed: std::sync::Mutex::new(None),
         })
     }
 
@@ -79,6 +174,51 @@ impl RemoteConsole {
             .map(|_| ())
     }
 
+    /// Re-read every head's size and recompute where this console sits in
+    /// the guest desktop. Cheap (one property read per head); called at
+    /// startup, on every button press, and at most once per second while the
+    /// pointer moves, so other windows resizing their heads is picked up.
+    pub(super) async fn refresh_head_map(&self) -> Result<()> {
+        if self.siblings.len() < 2 {
+            *self.head_map.lock().unwrap() = None;
+            return Ok(());
+        }
+        let mut sizes = Vec::with_capacity(self.siblings.len());
+        for (id, proxy) in &self.siblings {
+            let width = proxy
+                .width()
+                .await
+                .with_context(|| format!("console {id} width"))?;
+            let height = proxy
+                .height()
+                .await
+                .with_context(|| format!("console {id} height"))?;
+            sizes.push((*id, width, height));
+        }
+        let map = compute_head_map(&sizes, &self.explicit_layout, self.console_id);
+        *self.head_map.lock().unwrap() = map;
+        *self.head_map_refreshed.lock().unwrap() = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    async fn refresh_head_map_if_stale(&self) {
+        let stale = self
+            .head_map_refreshed
+            .lock()
+            .unwrap()
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+        if stale && self.siblings.len() >= 2 {
+            let _ = self.refresh_head_map().await;
+        }
+    }
+
+    fn map_abs(&self, x: u32, y: u32) -> (u32, u32) {
+        match *self.head_map.lock().unwrap() {
+            Some(map) => map_abs_position(&map, x, y),
+            None => (x, y),
+        }
+    }
+
     pub(super) async fn handle_input(&self, input: InputEvent) -> Result<()> {
         match input {
             InputEvent::KeyPress(keycode) => self
@@ -94,21 +234,28 @@ impl RemoteConsole {
             InputEvent::ClipboardViewerFocused(_) | InputEvent::ClipboardHostChanged(_, _) => {
                 Ok(())
             }
-            InputEvent::MousePress(button) => self
-                .mouse
-                .press(button)
-                .await
-                .with_context(|| format!("failed to send mouse press for {button:?}")),
+            InputEvent::MousePress(button) => {
+                if self.siblings.len() >= 2 {
+                    let _ = self.refresh_head_map().await;
+                }
+                self.mouse
+                    .press(button)
+                    .await
+                    .with_context(|| format!("failed to send mouse press for {button:?}"))
+            }
             InputEvent::MouseRelease(button) => self
                 .mouse
                 .release(button)
                 .await
                 .with_context(|| format!("failed to send mouse release for {button:?}")),
-            InputEvent::MouseAbs { x, y } => self
-                .mouse
-                .set_abs_position(x, y)
-                .await
-                .with_context(|| format!("failed to move the absolute mouse to {x},{y}")),
+            InputEvent::MouseAbs { x, y } => {
+                self.refresh_head_map_if_stale().await;
+                let (mx, my) = self.map_abs(x, y);
+                self.mouse
+                    .set_abs_position(mx, my)
+                    .await
+                    .with_context(|| format!("failed to move the absolute mouse to {x},{y}"))
+            }
             InputEvent::MouseRel { dx, dy } => self
                 .mouse
                 .rel_motion(dx, dy)
@@ -469,5 +616,50 @@ impl LocalConsoleListenerDmabuf2 {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod head_map_tests {
+    use super::{compute_head_map, map_abs_position};
+
+    #[test]
+    fn single_head_has_no_map() {
+        assert!(compute_head_map(&[(0, 1920, 1080)], &[], 0).is_none());
+    }
+
+    #[test]
+    fn auto_layout_places_heads_left_to_right() {
+        let sizes = [(1, 1280, 1024), (0, 2560, 1440)];
+        let head0 = compute_head_map(&sizes, &[], 0).unwrap();
+        let head1 = compute_head_map(&sizes, &[], 1).unwrap();
+        // head 0 at origin, head 1 to its right; total spans both
+        assert_eq!((head0.offset_x, head0.offset_y), (0, 0));
+        assert_eq!((head1.offset_x, head1.offset_y), (2560, 0));
+        assert_eq!((head0.total_width, head0.total_height), (3840, 1440));
+        // clicking the right edge of head 1 lands on the right edge of the desktop
+        let (x, _) = map_abs_position(&head1, 1279, 0);
+        assert_eq!((2560 + 1279) * 1280 / 3840, i64::from(x));
+        // clicking the middle of head 0 stays in head 0's half
+        let (x, y) = map_abs_position(&head0, 1280, 720);
+        assert_eq!((x, y), (1280 * 2560 / 3840, 720 * 1440 / 1440));
+    }
+
+    #[test]
+    fn explicit_layout_overrides_auto_placement() {
+        let sizes = [(0, 1920, 1080), (1, 1920, 1080)];
+        let head1 = compute_head_map(&sizes, &[(1, 0, 1080)], 1).unwrap(); // stacked below
+        assert_eq!((head1.offset_x, head1.offset_y), (0, 1080));
+        assert_eq!((head1.total_width, head1.total_height), (1920, 2160));
+        let (x, y) = map_abs_position(&head1, 100, 100);
+        assert_eq!((x, y), (100, (1080 + 100) * 1080 / 2160));
+    }
+
+    #[test]
+    fn mapped_positions_stay_inside_the_console() {
+        let sizes = [(0, 1000, 500), (1, 1000, 500)];
+        let head1 = compute_head_map(&sizes, &[], 1).unwrap();
+        let (x, y) = map_abs_position(&head1, 999, 499);
+        assert!(x < 1000 && y < 500);
     }
 }
