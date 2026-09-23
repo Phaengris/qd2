@@ -111,6 +111,13 @@ pub struct ConnectArgs {
     #[arg(long, value_name = "APP_ID")]
     pub name: Option<String>,
 
+    /// With `--fullscreen`: which monitor to fill, by connector name
+    /// (`DP-1`, `HDMI-A-1`), model name, or 0-based index in the display's
+    /// monitor list. Without it the window manager picks the monitor the
+    /// window happens to appear on, which is not stable across launches.
+    #[arg(long, value_name = "CONNECTOR|MODEL|INDEX")]
+    pub monitor: Option<String>,
+
     /// Multi-head guests: where each console sits in the guest's desktop, in
     /// guest pixels, as `ID:X,Y;ID:X,Y` (e.g. `0:0,0;1:2560,0`). Default: heads
     /// side by side left-to-right in console order, which is what KDE/GNOME do
