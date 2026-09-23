@@ -34,6 +34,11 @@ pub(super) struct RemoteConsole {
     siblings: Vec<(u32, ConsoleProxy<'static>)>,
     explicit_layout: Vec<(u32, i32, i32)>,
     head_map: std::sync::Mutex<Option<HeadMap>>,
+    /// Head map learned from the scanout itself (`ScanoutDMABUF2` backing
+    /// size + view offset), shared with the listener. Authoritative when set:
+    /// an X11 guest scans every head out of one framebuffer, so the view's
+    /// offset IS the head's position in the desktop, no guessing needed.
+    scanout_map: Arc<std::sync::Mutex<Option<HeadMap>>>,
     /// This console's own size, for clamping single-head positions.
     self_size: std::sync::Mutex<Option<(u32, u32)>>,
     head_map_refreshed: std::sync::Mutex<Option<std::time::Instant>>,
@@ -90,6 +95,36 @@ pub(super) fn compute_head_map(
         total_width,
         total_height,
     })
+}
+
+impl HeadMap {
+    /// Head map from a scanout that shows the `(x, y, width, height)` view of
+    /// a `backing_width` x `backing_height` buffer. `None` when the view is
+    /// the whole buffer (single head, or a guest with one buffer per output),
+    /// so the layout falls back to console sizes / `--head-layout`.
+    pub(super) fn from_scanout(
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        backing_width: u32,
+        backing_height: u32,
+    ) -> Option<Self> {
+        if width == 0 || height == 0 || backing_width == 0 || backing_height == 0 {
+            return None;
+        }
+        if x == 0 && y == 0 && width == backing_width && height == backing_height {
+            return None;
+        }
+        Some(Self {
+            offset_x: i64::from(x),
+            offset_y: i64::from(y),
+            width: i64::from(width),
+            height: i64::from(height),
+            total_width: i64::from(backing_width),
+            total_height: i64::from(backing_height),
+        })
+    }
 }
 
 /// Translate a console-local absolute position for QEMU (see [`HeadMap`]).
@@ -173,6 +208,7 @@ impl RemoteConsole {
             siblings,
             explicit_layout,
             head_map: std::sync::Mutex::new(None),
+            scanout_map: Arc::new(std::sync::Mutex::new(None)),
             self_size: std::sync::Mutex::new(None),
             head_map_refreshed: std::sync::Mutex::new(None),
         })
@@ -232,6 +268,9 @@ impl RemoteConsole {
 
     fn map_abs(&self, x: i32, y: i32) -> (u32, u32) {
         let (x, y) = (i64::from(x), i64::from(y));
+        if let Some(map) = *self.scanout_map.lock().unwrap() {
+            return map_abs_position(&map, x, y);
+        }
         match *self.head_map.lock().unwrap() {
             Some(map) => map_abs_position(&map, x, y),
             None => clamp_to_console(*self.self_size.lock().unwrap(), x, y),
@@ -309,7 +348,10 @@ impl RemoteConsole {
             let (socket0, socket1) =
                 UnixStream::pair().context("failed to allocate the listener socket pair")?;
             let listener_fd: Fd<'_> = (&socket0).into();
-            let shared = Arc::new(SharedListenerState::new(event_tx));
+            let shared = Arc::new(SharedListenerState::new(
+                event_tx,
+                self.scanout_map.clone(),
+            ));
 
             self.proxy
                 .register_listener(listener_fd)
@@ -343,14 +385,21 @@ impl RemoteConsole {
 struct SharedListenerState {
     handler: Mutex<FrameStreamHandler>,
     disconnected: AtomicBool,
+    scanout_map: Arc<std::sync::Mutex<Option<HeadMap>>>,
 }
 
 impl SharedListenerState {
-    fn new(event_tx: EventSender) -> Self {
+    fn new(event_tx: EventSender, scanout_map: Arc<std::sync::Mutex<Option<HeadMap>>>) -> Self {
         Self {
             handler: Mutex::new(FrameStreamHandler::new(event_tx)),
             disconnected: AtomicBool::new(false),
+            scanout_map,
         }
+    }
+
+    /// Record (or clear) the head geometry the latest scanout implies.
+    fn set_scanout_map(&self, map: Option<HeadMap>) {
+        *self.scanout_map.lock().unwrap() = map;
     }
 
     fn with_handler<T>(&self, f: impl FnOnce(&mut FrameStreamHandler) -> T) -> T {
@@ -396,6 +445,7 @@ impl LocalConsoleListener {
         format: u32,
         data: serde_bytes::ByteBuf,
     ) {
+        self.shared.set_scanout_map(None);
         self.shared.with_handler(|handler| {
             handler.scanout(Scanout {
                 width,
@@ -447,6 +497,7 @@ impl LocalConsoleListener {
             .try_clone_to_owned()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
 
+        self.shared.set_scanout_map(None);
         self.shared.with_handler(|handler| {
             handler.scanout_dmabuf(ScanoutDMABUF {
                 fd: [fd.into_raw_fd(), -1, -1, -1],
@@ -545,6 +596,7 @@ impl LocalConsoleListenerMap {
             .try_clone_to_owned()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
 
+        self.shared.set_scanout_map(None);
         self.shared.with_handler(|handler| {
             handler.scanout_map(ScanoutMap {
                 fd,
@@ -593,19 +645,31 @@ impl LocalConsoleListenerDmabuf2 {
     async fn scanout_dmabuf(
         &mut self,
         fd: Vec<Fd<'_>>,
-        _x: u32,
-        _y: u32,
+        x: u32,
+        y: u32,
         width: u32,
         height: u32,
         offset: Vec<u32>,
         stride: Vec<u32>,
         num_planes: u32,
         fourcc: u32,
-        _backing_width: u32,
-        _backing_height: u32,
+        backing_width: u32,
+        backing_height: u32,
         modifier: u64,
         y0_top: bool,
     ) -> zbus::fdo::Result<()> {
+        // X11 guests scan every head out of one shared framebuffer: the view
+        // offset inside the `backing_width` x `backing_height` buffer IS this
+        // head's position in the guest desktop. Whole-buffer scanouts (single
+        // head, Wayland guests) clear the map. Older QEMUs report a zero backing size.
+        self.shared.set_scanout_map(HeadMap::from_scanout(
+            x,
+            y,
+            width,
+            height,
+            backing_width,
+            backing_height,
+        ));
         let mut fds = [-1; 4];
         for (index, fd) in fd.into_iter().take(4).enumerate() {
             let owned = fd
@@ -635,6 +699,37 @@ impl LocalConsoleListenerDmabuf2 {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scanout_map_tests {
+    use super::{HeadMap, map_abs_position};
+
+    #[test]
+    fn whole_buffer_views_yield_no_map() {
+        assert_eq!(HeadMap::from_scanout(0, 0, 2560, 1440, 2560, 1440), None);
+        assert_eq!(HeadMap::from_scanout(0, 0, 2560, 1440, 0, 0), None);
+        assert_eq!(HeadMap::from_scanout(0, 0, 0, 0, 4480, 1440), None);
+    }
+
+    #[test]
+    fn x11_second_head_maps_into_the_shared_framebuffer() {
+        // 4480x1440 X screen, head 1 = 1920x1080 at (2560, 360).
+        let map = HeadMap::from_scanout(2560, 360, 1920, 1080, 4480, 1440).unwrap();
+        // Top-left of head 1 -> global (2560, 360), pre-scaled by 1920/4480 and 1080/1440.
+        assert_eq!(map_abs_position(&map, 0, 0), (1097, 270));
+        let (x, y) = map_abs_position(&map, 1919, 1079);
+        assert!(x < 1920 && y < 1080, "{x},{y}");
+        // Dragging left past the seam keeps moving onto head 0.
+        assert_eq!(map_abs_position(&map, -2560, -360), (0, 0));
+    }
+
+    #[test]
+    fn x11_first_head_keeps_its_origin() {
+        let map = HeadMap::from_scanout(0, 0, 2560, 1440, 4480, 1440).unwrap();
+        assert_eq!(map_abs_position(&map, 0, 0), (0, 0));
+        assert_eq!(map_abs_position(&map, 2559, 1439), (2559 * 2560 / 4480, 1439));
     }
 }
 
