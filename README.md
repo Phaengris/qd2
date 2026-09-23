@@ -48,6 +48,7 @@ QD2 is built for people who want the flexibility of QEMU's D-Bus display stack w
 | `--name <APP_ID>` | Set the viewer's application identity (Wayland app_id / X11 WM class) so taskbars and window rules can match it, like spicy's `--name`. | `qd2 connect --name my-vm-launcher` |
 | `--head-layout <ID:X,Y;...>` | Multi-head guests: where each console sits in the guest desktop (guest pixels). Default = heads side by side, left-to-right in console order. Must match the guest's display arrangement for clicks to land. | `qd2 connect -c 1 --head-layout "0:0,0;1:2560,0"` |
 | `--no-offload` | Composite frames through GTK instead of a compositor subsurface. Slower at large resolutions; a fallback if the offload path glitches on your compositor/GTK version. | `qd2 connect --no-offload` |
+| `--monitor <CONNECTOR\|MODEL\|INDEX>` | With `--fullscreen`: which host monitor to fill (connector name like `DP-1`/`HDMI-A-1`, monitor model, or 0-based index). Without it the window manager picks the monitor the window first appears on, which is not stable across launches. | `qd2 connect -c 1 --fullscreen --monitor HDMI-1` |
 
 ## 🖥️ Viewer Highlights
 
@@ -63,7 +64,8 @@ QD2 is built for people who want the flexibility of QEMU's D-Bus display stack w
 - Sharp guest cursor on HiDPI displays: the cursor is rendered inside the scene at content scale instead of through the GTK cursor API.
 - DMABUF frames are offloaded to a compositor subsurface (`GtkGraphicsOffload`), keeping large guest resolutions smooth in fullscreen.
 - Keyboard forwarding starts when the viewer window gains focus (once a display is presented), with host shortcuts restored on focus loss.
-- Multi-head guests: open one viewer per console (`-c 0`, `-c 1`, …). Absolute pointer positions are translated into the guest's global desktop, so clicks land correctly on every head, the pointer follows hovering between head windows without a click, and a window drag continues across the seam between heads; the guest must arrange its heads left-to-right at one scale (or pass `--head-layout`). Only the first window gets clipboard sync.
+- Multi-head guests: open one viewer per console (`-c 0`, `-c 1`, …), each fullscreen on its own host monitor (`--monitor`). Absolute pointer positions are translated into the guest's global desktop, so clicks land correctly on every head, the pointer follows hovering between head windows without a click, and a window drag continues across the seam between heads. X11 guests (one framebuffer for all outputs) report each head's position themselves, so any arrangement works; Wayland guests must arrange their heads left-to-right at one scale (or pass `--head-layout`). Only the first window gets clipboard sync.
+- X11 guests with several outputs scan every head out of one shared framebuffer. QD2 imports that buffer at its real size and shows the console's part of it; describing it with the head's width but the buffer's stride made Mesa refuse the import (black screen with garbage at the top).
 - Optional undecorated launch mode for tiling compositor workflows.
 - Top-bar actions for taking screenshots and sending guest shortcuts like `Ctrl+Alt+Delete`.
 - Configurable hotkeys for fullscreen, grab release, and DMABUF transforms.
