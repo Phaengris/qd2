@@ -652,6 +652,23 @@ fn run_window(
         }
     });
 
+    // Keep host shortcuts inhibited while grab mode is on. The focus handler
+    // above can run before GDK marks the surface focused (the inhibit is then
+    // a silent no-op), and host grabs (menus, alt-tab, screen lock) break
+    // ours; without a retry the Super key would reach the host until the user
+    // released and re-captured by hand.
+    glib::timeout_add_local(std::time::Duration::from_millis(500), {
+        let window = window.downgrade();
+        let input_grab = input_grab.clone();
+        move || {
+            let Some(window) = window.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            grab::ensure_inhibited(&window, &input_grab, None);
+            glib::ControlFlow::Continue
+        }
+    });
+
     let event_rx = Rc::new(RefCell::new(event_rx));
     let current_software = Rc::new(RefCell::new(None::<framebuffer::SoftwarePresenter>));
     #[cfg(unix)]

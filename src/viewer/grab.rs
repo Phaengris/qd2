@@ -40,13 +40,33 @@ pub(super) fn activate(
         }
     };
 
-    if changed {
-        if let Some(toplevel) = window_toplevel(window) {
+    // Ask for the keyboard even when the bookkeeping above says grab mode is
+    // already on: the bookkeeping only records intent. On X11 GDK's inhibit
+    // silently does nothing when the window is not focused yet, or when
+    // another client (the window manager, a menu) holds a grab at that
+    // instant, and it drops the grab on GrabBroken. Every click re-asserts.
+    ensure_inhibited(window, state, event);
+
+    changed
+}
+
+/// While grab mode is on and the window is focused, make sure host shortcuts
+/// are really inhibited (GDK's `shortcuts-inhibited` is the source of truth)
+/// and ask again if not. A property read when nothing is missing, so it is
+/// also called from a periodic check.
+pub(super) fn ensure_inhibited(
+    window: &gtk::Window,
+    state: &SharedInputGrab,
+    event: Option<&gdk::Event>,
+) {
+    if !state.borrow().active || !window.is_active() {
+        return;
+    }
+    if let Some(toplevel) = window_toplevel(window) {
+        if !toplevel.is_shortcuts_inhibited() {
             toplevel.inhibit_system_shortcuts(event);
         }
     }
-
-    changed
 }
 
 pub(super) fn release(window: &gtk::Window, state: &SharedInputGrab) -> bool {
