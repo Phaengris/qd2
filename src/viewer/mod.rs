@@ -209,6 +209,17 @@ fn run_window(
     status_label.set_margin_bottom(12);
     status_label.set_margin_start(12);
     status_label.set_margin_end(12);
+    // The status line floats over the display instead of sitting above it.
+    // As a sibling of the picture it shrank the picture by one line whenever a
+    // message appeared, auto-resize then asked the guest for a smaller
+    // resolution, and the next frame (which hides the label) asked for the old
+    // one again — the guest changed resolution every ~2 s while messages kept
+    // coming (a guest lock screen rebuilt itself on every flip and could not
+    // be unlocked). Never a click target, so input still reaches the picture.
+    status_label.set_halign(gtk::Align::Center);
+    status_label.set_valign(gtk::Align::Start);
+    status_label.set_can_target(false);
+    status_label.add_css_class("osd");
 
     // Hand dmabuf frames straight to the compositor as a subsurface instead of
     // compositing them through GTK's GL renderer — at large guest resolutions
@@ -216,7 +227,6 @@ fn run_window(
     // keeps the subsurface below the UI so overlays (in-scene cursor,
     // fullscreen bar) can still draw on top.
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    container.append(&status_label);
     if no_offload {
         container.append(&picture);
     } else {
@@ -228,6 +238,7 @@ fn run_window(
     }
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&container));
+    overlay.add_overlay(&status_label);
 
     let window = gtk::Window::builder()
         .title(&ready.title)
@@ -829,7 +840,7 @@ fn run_window(
                     ClipboardSelection::Clipboard,
                     &content,
                 ) {
-                    latest_status = Some(format!("Clipboard sync failed: {error:#}"));
+                    eprintln!("QD2 clipboard: applying guest clipboard failed: {error:#}");
                 }
             }
 
@@ -840,7 +851,7 @@ fn run_window(
                     ClipboardSelection::Primary,
                     &content,
                 ) {
-                    latest_status = Some(format!("Clipboard sync failed: {error:#}"));
+                    eprintln!("QD2 clipboard: applying guest clipboard failed: {error:#}");
                 }
             }
 

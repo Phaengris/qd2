@@ -661,10 +661,11 @@ impl ClipboardHandler for ClipboardListener {
         }
 
         if content.is_empty() {
+            // Not a status-line message: fetches fail routinely (the guest
+            // changed or dropped its selection before answering, QEMU then
+            // cancels the request), and each one used to flash over the display.
             if let Some(error) = first_error {
-                let _ = self.event_tx.send(ViewerEvent::Status(format!(
-                    "Clipboard fetch failed: {error:#}"
-                )));
+                debug(format!("clipboard fetch failed: {error:#}"));
             }
             return;
         }
