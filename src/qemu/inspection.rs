@@ -100,6 +100,7 @@ pub async fn resolve_connect_target(
         height: console.height,
         console_interfaces: console.interfaces.clone(),
         console_ids: report.vm.console_ids.clone(),
+        share_clipboard: true,
         head_layout: Vec::new(),
         warnings: report.warnings,
     })

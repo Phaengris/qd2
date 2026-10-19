@@ -42,6 +42,11 @@ pub struct ConnectTarget {
     pub console_ids: Vec<u32>,
     /// Explicit guest layout `(console id, x, y)` in guest pixels; empty = auto.
     pub head_layout: Vec<(u32, i32, i32)>,
+    /// Register as the VM's clipboard peer and mirror the host selections.
+    /// Off with `--no-clipboard`: another agent (a host/guest sync tool)
+    /// carries the clipboard, or the host GTK leaks per served request
+    /// (GTK < 4.23.3 on X11, GNOME/gtk#6493).
+    pub share_clipboard: bool,
     pub warnings: Vec<String>,
 }
 

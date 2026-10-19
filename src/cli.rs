@@ -126,6 +126,14 @@ pub struct ConnectArgs {
     #[arg(long, value_name = "ID:X,Y;...")]
     pub head_layout: Option<String>,
 
+    /// Don't share the clipboard with the guest (neither direction). Use it
+    /// when another tool already syncs the clipboard, or on an X11 host with
+    /// GTK older than 4.23.3: there GTK leaks a selection stream for every
+    /// clipboard request the viewer serves (GNOME/gtk#6493), and the viewer
+    /// gets slower with each guest copy until it is restarted.
+    #[arg(long)]
+    pub no_clipboard: bool,
+
     /// Composite frames through GTK instead of offloading them to a compositor
     /// subsurface. Slower at large resolutions, but a useful fallback if the
     /// offload path glitches on your compositor/GTK version.
