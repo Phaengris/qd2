@@ -219,6 +219,12 @@ struct PressedKeyState {
 
 impl PressedKeyState {
     fn press(&mut self, qnum: u32) -> bool {
+        // A new press means any release we were still waiting to swallow is
+        // never coming: that release went to the host while we had no focus
+        // (focus lost mid-chord, e.g. a compositor bind that minimizes the
+        // viewer). Keeping the suppression would eat the *next* release of
+        // this key and leave it held in the guest.
+        self.suppressed_releases.remove(&qnum);
         self.pressed.insert(qnum)
     }
 
@@ -472,6 +478,24 @@ mod tests {
         assert!(state.take_suppressed_release(29));
         assert!(state.take_suppressed_release(56));
         assert!(!state.take_suppressed_release(29));
+    }
+
+    #[test]
+    fn a_new_press_forgets_a_release_that_never_arrived() {
+        // Focus left while Super was down: release_all sent the guest a
+        // release and armed a suppression for the physical release. That
+        // release went to the host instead. The next press/release of Super
+        // must reach the guest in full, or Super stays held there.
+        let (input_tx, mut input_rx) = tokio_mpsc::unbounded_channel();
+        let mut state = PressedKeyState::default();
+
+        assert!(state.press(219));
+        state.release_all(&input_tx);
+        while input_rx.try_recv().is_ok() {}
+
+        assert!(state.press(219));
+        assert!(!state.take_suppressed_release(219));
+        assert!(state.release(219));
     }
 
     #[test]
