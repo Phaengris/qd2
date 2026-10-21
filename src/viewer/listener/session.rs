@@ -13,6 +13,16 @@ use super::super::{
 use super::remote::RemoteConsole;
 
 const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum time between a button release and the next press of the same button
+/// as seen by the guest (see the double-tap note in `listener_session`).
+const MIN_PRESS_GAP: Duration = Duration::from_millis(30);
+
+static INPUT_DEBUG_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn input_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("QD2_INPUT_DEBUG").is_some_and(|v| v != "0"))
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum SessionOutcome {
@@ -117,6 +127,8 @@ pub(super) async fn listener_session(
     };
     let _ = ready_tx.send(Ok(ready));
 
+    let mut last_release: std::collections::HashMap<u32, std::time::Instant> =
+        std::collections::HashMap::new();
     loop {
         tokio::select! {
             _ = &mut *shutdown_rx => return Ok(SessionOutcome::Shutdown),
@@ -173,6 +185,34 @@ pub(super) async fn listener_session(
                     }
 
                     let needs_mouse_mode = mouse::input_needs_mouse_mode(&input);
+                    // A trackpad double tap: libinput on the host holds the first
+                    // tap's release until its tap timeout, then emits release and
+                    // the second press back to back (0.5 ms apart here). Forwarded
+                    // 1:1 over D-Bus they land in the guest as two frames under a
+                    // millisecond apart, and the guest's libinput drops the pair as
+                    // button bounce: one long press, no double click. A mouse never
+                    // produces that pattern. Hold a press until MIN_PRESS_GAP after
+                    // the last release of the same button; 34 ms was enough in the
+                    // measurement, 0.5 ms was not.
+                    if let InputEvent::MousePress(button) = &input {
+                        if let Some(released_at) = last_release.get(&(*button as u32)) {
+                            let gap = released_at.elapsed();
+                            if gap < MIN_PRESS_GAP {
+                                tokio::time::sleep(MIN_PRESS_GAP - gap).await;
+                            }
+                        }
+                    }
+                    if input_debug_enabled() {
+                        // QD2_INPUT_DEBUG=1: one line per forwarded input event, with a
+                        // monotonic timestamp in ms, to compare against what the host
+                        // delivers and what the guest's libinput sees.
+                        let t = INPUT_DEBUG_EPOCH.get_or_init(std::time::Instant::now).elapsed();
+                        eprintln!("[qd2-input] {:>10.3} ms {:?}", t.as_secs_f64() * 1000.0, input);
+                    }
+                    let released_button = match &input {
+                        InputEvent::MouseRelease(button) => Some(*button),
+                        _ => None,
+                    };
                     if let Err(error) = console.handle_input(input).await {
                         let recovered = if needs_mouse_mode {
                             match console.mouse_is_absolute().await {
@@ -202,6 +242,9 @@ pub(super) async fn listener_session(
                                 "Input forwarding failed: {error:#}"
                             )));
                         }
+                    }
+                    if let Some(button) = released_button {
+                        last_release.insert(button as u32, std::time::Instant::now());
                     }
                 }
                 None => return Ok(SessionOutcome::Shutdown),
