@@ -370,7 +370,7 @@ pub(super) async fn register_clipboard_bridge(
     let display = Display::new(connection, Some(owner.to_owned()))
         .await
         .context("failed to open the QEMU display object for clipboard sharing")?;
-    let Some(clipboard) = display
+    let Some(mut clipboard) = display
         .clipboard()
         .await
         .context("failed to inspect the QEMU clipboard interface")?
@@ -378,6 +378,20 @@ pub(super) async fn register_clipboard_bridge(
         debug("qemu display has no clipboard object");
         return Ok(None);
     };
+    // qemu-display 0.2.1 builds the clipboard proxy without a destination, so
+    // it goes to whichever qemu holds the well-known name `org.qemu` on the
+    // bus: with two VMs on one bus, always the first one started. A viewer of
+    // the second VM then registers as the FIRST VM's clipboard peer (or fails
+    // with "peer already registered" when that VM's own viewer holds it).
+    // Rebuild the proxy against the owner we are actually viewing.
+    clipboard.proxy = qemu_display::ClipboardProxy::builder(connection)
+        .destination(owner.to_owned())
+        .context("invalid QEMU display owner for the clipboard proxy")?
+        .path("/org/qemu/Display1/Clipboard")
+        .context("invalid clipboard object path")?
+        .build()
+        .await
+        .context("failed to build the QEMU clipboard proxy")?;
 
     let shared = Arc::new(Mutex::new(ClipboardBridgeState::default()));
     clipboard
